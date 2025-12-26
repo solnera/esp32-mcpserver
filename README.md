@@ -4,7 +4,7 @@
 
 We are changing this with MCP-native hardware. By standardizing device communication through the Model Context Protocol, we empower users to bring their own intelligence (LLMs) to their devices. This is the first step toward a future of local-first AI and genuinely decentralized hardware ecosystems."
 
-If you have ideas or want to collaborate, feel free to reach out by [email](liuyf1117@hotmail.com).
+If you have ideas or want to collaborate, feel free to reach out by [email](mailto:liuyf1117@hotmail.com).
 
 # ESP32 MCP Server
 
