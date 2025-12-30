@@ -4,7 +4,6 @@
 
 We are changing this with MCP-native hardware. By standardizing device communication through the Model Context Protocol, we empower users to bring their own intelligence (LLMs) to their devices. This is the first step toward a future of local-first AI and genuinely decentralized hardware ecosystems."
 
-If you have ideas or want to collaborate, feel free to reach out by [email](mailto:liuyf1117@hotmail.com).
 
 # ESP32 MCP Server
 
@@ -125,3 +124,9 @@ The server exposes a single endpoint for MCP traffic:
 - **Headers**: 
   - `Content-Type: application/json`
   - `mcp-session-id`: (Optional) Session identifier
+
+# Contact Us
+
+
+- 📧 **Email**: [liuyf1117@hotmail.com](mailto:liuyf1117@hotmail.com)
+- 💬 **Slack**: [Join our community](https://solnera.slack.com/archives/C0A5P62J6NT)
