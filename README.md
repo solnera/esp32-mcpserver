@@ -129,4 +129,4 @@ The server exposes a single endpoint for MCP traffic:
 
 
 - 📧 **Email**: [liuyf1117@hotmail.com](mailto:liuyf1117@hotmail.com)
-- 💬 **Slack**: [Join our community](https://solnera.slack.com/archives/C0A5P62J6NT)
+- 💬 **Slack**: [Join our community](https://join.slack.com/t/solnera/shared_invite/zt-3m2oat3br-~2JsOdxNW7XPnEgb5bjUdg)
