@@ -1,0 +1,24 @@
+name: PlatformIO Registry Publish
+
+on:
+  release:
+    types: [published] # 当你发布一个新的 Release 时触发
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Publish Library
+        run: pio pkg publish --non-interactive
+        env:
+          PLATFORMIO_AUTH_TOKEN: ${{ secrets.PLATFORMIO_AUTH_TOKEN }}
