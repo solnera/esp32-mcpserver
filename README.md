@@ -85,25 +85,22 @@ In your `setup()` function, define the tool metadata and schema, then register i
 
 ```cpp
 // Create tool definition
-Tool myTool;
-myTool.name = "echo";
-myTool.description = "Echo back the input text";
+Tool echoTool;
+echoTool.name = "echo";
+echoTool.description = "Echo back the input text";
 
-// Define input schema
-Properties textProperty;
-textProperty.type = "string";
-textProperty.description = "Text to echo back";
-
-myTool.inputSchema.type = "object";
-myTool.inputSchema.description = "Echo tool parameters";
-myTool.inputSchema.properties["text"] = textProperty;
-myTool.inputSchema.required.push_back("text");
+// Define input schema using fluent Schema builder
+echoTool.inputSchema = Schema::object()
+    .description("Echo tool parameters")
+    .property("text", Schema::string().description("Text to echo back"))
+    .required({"text"})
+    .build();
 
 // Attach handler
-myTool.handler = std::make_shared<EchoHandler>();
+echoTool.handler = std::make_shared<EchoHandler>();
 
 // Register with server
-mcpServer->RegisterTool(myTool);
+mcpServer->RegisterTool(echoTool);
 ```
 
 ### 4. Initialization
