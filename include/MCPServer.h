@@ -7,48 +7,45 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 // MCP protocol version
-const char* const PROTOCOL_VERSION = "2024-11-05";
-const char* const DEFAULT_SERVER_NAME = "ESP32-MCP-Server";
-const char* const DEFAULT_SERVER_VERSION = "1.0.0";
+constexpr const char* PROTOCOL_VERSION = "2024-11-05";
+constexpr const char* DEFAULT_SERVER_NAME = "ESP32-MCP-Server";
+constexpr const char* DEFAULT_SERVER_VERSION = "1.0.0";
 
 struct MCPRequest {
     std::string method;
-    JsonDocument idDoc;  // Store id as JsonDocument to preserve type (string, number, or null)
+    JsonDocument idDoc;
     JsonDocument paramsDoc;
 
     MCPRequest() : method("") {}
 
-    // Get JsonVariant reference of params
     JsonVariantConst params() const {
         return paramsDoc.as<JsonVariantConst>();
     }
 
-    // Get JsonVariant reference of id
     JsonVariantConst id() const {
         return idDoc.as<JsonVariantConst>();
     }
 
-    // Check if params is empty
     bool hasParams() const {
         return !paramsDoc.isNull();
     }
 };
 
 struct MCPResponse {
-    JsonDocument idDoc;  // Store id as JsonDocument to preserve type
+    JsonDocument idDoc;
     JsonDocument resultDoc;
     JsonDocument errorDoc;
-    int code;  // http status code
+    int code;
 
     MCPResponse() : code(200) {}
     MCPResponse(int code, const JsonVariantConst& id) : code(code) {
         idDoc.set(id);
     }
 
-    // Get JsonVariant reference of id, result and error
     JsonVariantConst id() const {
         return idDoc.as<JsonVariantConst>();
     }
@@ -59,7 +56,6 @@ struct MCPResponse {
         return errorDoc.as<JsonVariantConst>();
     }
 
-    // Check if result or error is empty
     bool hasResult() const {
         return !resultDoc.isNull();
     }
@@ -78,155 +74,162 @@ enum class ErrorCode {
     PARSE_ERROR = -32700
 };
 
+// Fluent JSON Schema builder
+class Schema {
+public:
+    Schema() = default;
+
+    // Type factory methods
+    static Schema object()  { Schema s; s.doc_["type"] = "object"; s.doc_["properties"].to<JsonObject>(); return s; }
+    static Schema string()  { Schema s; s.doc_["type"] = "string";  return s; }
+    static Schema integer() { Schema s; s.doc_["type"] = "integer"; return s; }
+    static Schema number()  { Schema s; s.doc_["type"] = "number";  return s; }
+    static Schema boolean() { Schema s; s.doc_["type"] = "boolean"; return s; }
+    static Schema array()   { Schema s; s.doc_["type"] = "array";   return s; }
+    static Schema null()    { Schema s; s.doc_["type"] = "null";    return s; }
+
+    // Common modifiers
+    Schema& description(const char* desc) { doc_["description"] = desc; return *this; }
+    Schema& title(const char* t)          { doc_["title"] = t;         return *this; }
+    Schema& format(const char* f)         { doc_["format"] = f;        return *this; }
+
+    // Default value (supports any JSON type)
+    template <typename T>
+    Schema& defaultValue(T value) { doc_["default"] = value; return *this; }
+
+    // Object modifiers
+    Schema& property(const char* name, Schema prop) {
+        doc_["properties"][name].set(prop.doc_);
+        return *this;
+    }
+    Schema& required(std::initializer_list<const char*> fields) {
+        for (auto& f : fields) doc_["required"].add(f);
+        return *this;
+    }
+    Schema& additionalProperties(bool v) {
+        doc_["additionalProperties"] = v;
+        return *this;
+    }
+
+    // Array modifiers
+    Schema& items(Schema item) {
+        doc_["items"].set(item.doc_);
+        return *this;
+    }
+    Schema& minItems(int n) { doc_["minItems"] = n; return *this; }
+    Schema& maxItems(int n) { doc_["maxItems"] = n; return *this; }
+
+    // Number/integer modifiers
+    Schema& minimum(double v)          { doc_["minimum"] = v;          return *this; }
+    Schema& maximum(double v)          { doc_["maximum"] = v;          return *this; }
+    Schema& exclusiveMinimum(double v) { doc_["exclusiveMinimum"] = v; return *this; }
+    Schema& exclusiveMaximum(double v) { doc_["exclusiveMaximum"] = v; return *this; }
+    Schema& multipleOf(double v)       { doc_["multipleOf"] = v;       return *this; }
+
+    // String modifiers
+    Schema& minLength(int n) { doc_["minLength"] = n; return *this; }
+    Schema& maxLength(int n) { doc_["maxLength"] = n; return *this; }
+    Schema& pattern(const char* p) { doc_["pattern"] = p; return *this; }
+
+    // Enum
+    Schema& enumValues(std::initializer_list<const char*> vals) {
+        for (auto& v : vals) doc_["enum"].add(v);
+        return *this;
+    }
+    // Enum for numeric values
+    template <typename T>
+    Schema& enumValues(std::initializer_list<T> vals) {
+        for (auto& v : vals) doc_["enum"].add(v);
+        return *this;
+    }
+
+    // Composition
+    Schema& oneOf(std::initializer_list<Schema> schemas) {
+        for (auto& s : schemas) doc_["oneOf"].add(s.doc_);
+        return *this;
+    }
+    Schema& anyOf(std::initializer_list<Schema> schemas) {
+        for (auto& s : schemas) doc_["anyOf"].add(s.doc_);
+        return *this;
+    }
+    Schema& allOf(std::initializer_list<Schema> schemas) {
+        for (auto& s : schemas) doc_["allOf"].add(s.doc_);
+        return *this;
+    }
+
+    // Build to JsonDocument
+    JsonDocument build() { return std::move(doc_); }
+
+private:
+    JsonDocument doc_;
+};
+
 class ToolHandler {
-   public:
+public:
     virtual ~ToolHandler() = default;
     virtual JsonDocument call(JsonDocument params) = 0;
 };
 
-class Properties {
-   public:
-    Properties() = default;
-
-    // Enable deep copy semantics to support usage in STL containers and assignment
-    Properties(const Properties& other) {
-        type = other.type;
-        title = other.title;
-        description = other.description;
-        properties = other.properties;
-        required = other.required;
-        additionalProperties = other.additionalProperties;
-        hasAdditionalProperties = other.hasAdditionalProperties;
-        if (other.items) {
-            items.reset(new Properties(*other.items));
-        } else {
-            items.reset(nullptr);
-        }
-        enumValues = other.enumValues;
-        oneOf = other.oneOf;
-        anyOf = other.anyOf;
-        allOf = other.allOf;
-        format = other.format;
-        defaultValue = other.defaultValue;
-    }
-
-    Properties& operator=(const Properties& other) {
-        if (this != &other) {
-            type = other.type;
-            title = other.title;
-            description = other.description;
-            properties = other.properties;
-            required = other.required;
-            additionalProperties = other.additionalProperties;
-            hasAdditionalProperties = other.hasAdditionalProperties;
-            if (other.items) {
-                items.reset(new Properties(*other.items));
-            } else {
-                items.reset(nullptr);
-            }
-            enumValues = other.enumValues;
-            oneOf = other.oneOf;
-            anyOf = other.anyOf;
-            allOf = other.allOf;
-            format = other.format;
-            defaultValue = other.defaultValue;
-        }
-        return *this;
-    }
-
-    Properties(Properties&&) = default;
-    Properties& operator=(Properties&&) = default;
-
-    // JSON Schema basic information: type field supporting object, array, string, number, integer, boolean, null
-    String type;
-    // Optional JSON Schema title providing a human-readable short name
-    String title;
-    // Optional JSON Schema description explaining the purpose of the field or structure
-    String description;
-    // Used when type is object to represent the set of object properties
-    std::map<String, Properties> properties;
-    // Used when type is object to represent the list of required property names
-    std::vector<String> required;
-
-    // Controls whether the object allows additional properties
-    // The additionalProperties keyword is serialized only if hasAdditionalProperties is true
-    bool additionalProperties = true;
-    bool hasAdditionalProperties = false;
-
-    // Used when type is array to define the schema of array elements
-    std::unique_ptr<Properties> items;
-
-    // Corresponds to the JSON Schema enum keyword, representing the set of allowed values (stored as strings)
-    std::vector<String> enumValues;
-
-    // Corresponds to the JSON Schema oneOf keyword, representing one of several mutually exclusive schemas
-    std::vector<Properties> oneOf;
-    // Corresponds to the JSON Schema anyOf keyword, where matching any single schema is sufficient
-    std::vector<Properties> anyOf;
-    // Corresponds to the JSON Schema allOf keyword, requiring all schemas to be satisfied
-    std::vector<Properties> allOf;
-
-    // Aligns with the JSON Schema format keyword, such as "uri" or "date-time"
-    String format;
-
-    // Optional default value aligned with the JSON Schema default keyword (stored as a string)
-    String defaultValue;
-
-    String toString() const;
-    void toJson(JsonObject& obj) const;
-};
-
 // Tool definition
 class Tool {
-   public:
+public:
     Tool() = default;
-    Tool(const Tool&) = default;
-    Tool& operator=(const Tool&) = default;
-    Tool(Tool&&) = default;
-    Tool& operator=(Tool&&) = default;
 
-    // Tool name corresponding to tool.name in the MCP specification, must be unique and follow naming constraints
     String name;
-    // Tool description corresponding to tool.description in the MCP specification, describing tool behavior
     String description;
-    // Input parameter schema corresponding to tool.inputSchema in the MCP specification
-    Properties inputSchema;
-    // Output result schema corresponding to tool.outputSchema in the MCP specification
-    Properties outputSchema;
-    // Tool handler implementing the actual business logic
+    JsonDocument inputSchema;
+    JsonDocument outputSchema;
     std::shared_ptr<ToolHandler> handler;
+};
 
-    String toString() const;
+// Flexible array body buffer, allocated with a single malloc() so that
+// ESPAsyncWebServer's free(_tempObject) cleanly releases everything.
+struct BodyBuffer {
+    size_t length;
+    size_t capacity;
+    char data[];  // C99 flexible array member (supported by GCC/Clang)
+
+    static BodyBuffer* create(size_t capacity) {
+        auto* buf = static_cast<BodyBuffer*>(malloc(sizeof(BodyBuffer) + capacity + 1));
+        if (buf) {
+            buf->length = 0;
+            buf->capacity = capacity;
+            buf->data[0] = '\0';
+        }
+        return buf;
+    }
 };
 
 class MCPServer {
-   public:
-    MCPServer(uint16_t port, const String& name = DEFAULT_SERVER_NAME, const String& version = DEFAULT_SERVER_VERSION,
+public:
+    MCPServer(uint16_t port, const String& name = DEFAULT_SERVER_NAME,
+              const String& version = DEFAULT_SERVER_VERSION,
               const String& instructions = "");
     ~MCPServer();
     void RegisterTool(const Tool& tool);
 
-   private:
+private:
     void setupWebServer();
     std::string generateSessionId();
     std::string serializeResponse(const MCPResponse& response);
-    std::string createHTTPResponse(bool success, const std::string& message, const JsonVariant& data);
-    std::string createJSONRPCResponse(const JsonVariant& id, const JsonVariant& result);
 
     MCPRequest parseRequest(const std::string& json);
 
-    MCPResponse createJSONRPCError(int httpCode, int code, const JsonVariantConst& id, const std::string& message);
+    MCPResponse createJSONRPCError(int httpCode, int code, const JsonVariantConst& id,
+                                   const std::string& message);
     MCPResponse handle(MCPRequest& request);
     MCPResponse handleInitialize(MCPRequest& request);
     MCPResponse handleInitialized(MCPRequest& request);
     MCPResponse handleToolsList(MCPRequest& request);
     MCPResponse handleFunctionCalls(MCPRequest& request);
 
-   private:
+private:
     std::map<String, Tool> tools;
+    std::mutex toolsMutex;
     AsyncWebServer* server;
     String serverName;
     String serverVersion;
     String serverInstructions;
 };
+
 #endif  // MCP_SERVER_H

@@ -42,16 +42,14 @@ void setup() {
     Tool echoTool;
     echoTool.name = "echo";
     echoTool.description = "Echo back the input text";
-    echoTool.inputSchema.type = "object";
-    echoTool.inputSchema.description = "Echo tool parameters";
-    Properties textProperty;
-    textProperty.type = "string";
-    textProperty.description = "Text to echo back";
-    echoTool.inputSchema.properties["text"] = textProperty;
-    echoTool.inputSchema.required.push_back("text");
+    echoTool.inputSchema = Schema::object()
+        .description("Echo tool parameters")
+        .property("text", Schema::string().description("Text to echo back"))
+        .required({"text"})
+        .build();
     echoTool.handler = std::make_shared<EchoHandler>();
     mcpServer->RegisterTool(echoTool);
-    Serial.println("✓ Tool registered: echo");
+    Serial.println("Tool registered: echo");
     Serial.println("\n========================================");
     Serial.println("MCP Server started successfully!");
     Serial.printf("Access URL: http://%s:%d/mcp\n", WiFi.localIP().toString().c_str(), MCP_PORT);
