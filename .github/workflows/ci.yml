@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Run native tests
+        run: pio test -e native
+
+      # Builds the enabled side of MCP_OMIT_TEXT_WHEN_STRUCTURED so the
+      # opt-out cannot rot unnoticed.
+      - name: Run protocol suite with text mirroring disabled
+        run: pio test -e native-omit-text
+
+      - name: Run native tests under ASan/UBSan
+        run: pio test -e native-san
+        env:
+          # alloc_dealloc_mismatch catches new/delete objects handed to a
+          # free()-based teardown (the ESPAsyncWebServer _tempObject contract).
+          # Leak checking stays off because the FreeRTOS task mock leaks by
+          # design: workerEntry ends with vTaskDelete(NULL), and the mock cannot
+          # map the calling std::thread back to the handle xTaskCreate returned,
+          # so the std::thread object is never reclaimed. On real FreeRTOS
+          # vTaskDelete(NULL) frees the task itself.
+          ASAN_OPTIONS: alloc_dealloc_mismatch=1:detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      # Line coverage over src/ and include/ only; fails the job below the
+      # threshold. See scripts/coverage.sh for how the .gcda are merged.
+      - name: Line coverage (>= 80%)
+        run: ./scripts/coverage.sh 80
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Static analysis (cppcheck)
+        run: pio check -e native --fail-on-defect=high --fail-on-defect=medium
+
+  build-example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Cache PlatformIO platform and toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/platforms
+            ~/.platformio/packages
+            ~/.platformio/.cache
+          key: pio-${{ runner.os }}-espressif32
+
+      # --lib . injects the WORKING TREE as the library, bypassing the registry
+      # pin in the example's own platformio.ini — so every push verifies current
+      # code + example under the real xtensa toolchain.
+      - name: Build example against working tree
+        run: >
+          pio ci examples/echo/src
+          --lib .
+          --board esp32-s3-devkitc-1
+          --project-option="platform=espressif32@^7"
+          --project-option="framework=arduino"
+          --project-option="build_flags=-std=gnu++17"
+          --project-option="lib_deps=ESP32Async/ESPAsyncWebServer@^3.6.0, ESP32Async/AsyncTCP@^3.3.2"

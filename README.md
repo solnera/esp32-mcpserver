@@ -11,19 +11,27 @@ A lightweight Model Context Protocol (MCP) server implementation for the ESP32 m
 
 ## Features
 
-- **Protocol Support**: Full implementation of the MCP JSON-RPC 2.0 protocol over HTTP.
+- **Protocol Support**: MCP JSON-RPC 2.0 over Streamable HTTP, with version negotiation across `2025-11-25` (default), `2025-06-18`, and `2025-03-26`.
 - **Tool System**: Easy-to-use API for defining and registering custom tools with JSON Schema validation.
-- **Session Management**: Built-in handling of MCP session IDs.
+- **Blocking handlers are safe**: `tools/call` runs on a dedicated worker task, so a handler that waits on a sensor or on I/O never stalls the async TCP task that services every connection on the device.
+- **Stateless transport**: no session identifier is issued or required.
 - **Asynchronous**: Built on `ESPAsyncWebServer` for non-blocking operation.
 - **Schema Validation**: robust input/output schema definition using a fluent C++ API.
+- **Discovery**: advertises itself over mDNS as `_mcp._tcp`.
+- **Hardened request path**: body-size cap, `Origin` validation, and strict JSON-RPC envelope checks (see [Request handling](#request-handling)).
 
 ## Supported MCP Methods
 
 The server currently supports the following MCP methods:
 - `initialize`: Server handshake and capability negotiation.
+- `ping`: Liveness probe; answers with an empty result.
 - `notifications/initialized`: Client acknowledgment.
 - `tools/list`: Discovery of available tools.
 - `tools/call`: Execution of tool logic.
+
+Tool results are returned both as text content and, when the handler returns a
+JSON object, as `structuredContent`. Define `MCP_OMIT_TEXT_WHEN_STRUCTURED=1` to
+send only the structured form and keep the payload off the wire twice.
 
 ## Prerequisites
 
@@ -31,26 +39,40 @@ The server currently supports the following MCP methods:
 - **Software**: 
   - [PlatformIO](https://platformio.org/) (recommended) or Arduino IDE.
   - Required Libraries:
-    - `ArduinoJson`
-    - `ESPAsyncWebServer`
-    - `AsyncTCP` (for ESP32)
+    - `bblanchon/ArduinoJson@^7.0.0`
+    - `ESP32Async/ESPAsyncWebServer@^3.6.0`
+    - `ESP32Async/AsyncTCP@^3.3.2`
+
+  > The `ESPAsyncWebServer` / `AsyncTCP` forks maintained by the
+  > [ESP32Async](https://github.com/ESP32Async) organization are the
+  > actively maintained successors to the unmaintained `me-no-dev` originals.
 
 ## Installation
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/yourusername/esp32-mcpserver.git
-   ```
-2. Open the project in PlatformIO.
-3. Install the required dependencies (PlatformIO should handle this automatically via `platformio.ini`).
+Add the library to your project's `platformio.ini`:
+
+```ini
+lib_deps =
+    solnera/ESP32-MCPServer@^0.2.0
+    ESP32Async/ESPAsyncWebServer@^3.6.0
+    ESP32Async/AsyncTCP@^3.3.2
+```
+
+To work on the library itself instead, clone it and open the repository in
+PlatformIO; `platformio.ini` here configures the native test environments.
+
+```bash
+git clone https://github.com/solnera/esp32-mcpserver.git
+```
 
 ## Usage
 
-`src/main.cpp` is an example sketch that demonstrates connecting to WiFi, starting the MCP server, and registering the `echo` tool.
+[`examples/echo`](examples/echo) is a complete sketch that connects to WiFi,
+starts the MCP server, and registers the `echo` tool.
 
 ### 1. Configuration
 
-Open `src/main.cpp` and configure your WiFi credentials:
+Open `examples/echo/src/main.ino` and configure your WiFi credentials:
 
 ```cpp
 const char* ssid = "YOUR_WIFI_SSID";
@@ -105,22 +127,69 @@ mcpServer->RegisterTool(echoTool);
 
 ### 4. Initialization
 
-Initialize the server with a port, name, version, and optional system instructions:
+Construct the server with a port, name, version, and optional system
+instructions, then start it with `begin()` **after** every tool is registered
+and **after** WiFi is connected:
 
 ```cpp
 mcpServer = new MCPServer(3000, "echo service", "1.0.0",
                           "You are an intelligent device that supports the MCP protocol.");
+
+mcpServer->RegisterTool(std::move(echoTool));
+
+if (!mcpServer->begin()) {
+    Serial.println("Failed to start MCP server!");
+}
 ```
+
+`begin()` is required: the constructor no longer starts listening on its own.
+Registering tools first keeps request handlers from racing mutations of the tool
+registry, and `begin()` reads `WiFi.localIP()` to publish the mDNS endpoint.
 
 ## API Reference
 
 The server exposes a single endpoint for MCP traffic:
 
-- **Endpoint**: `POST /mcp`
+- **Endpoint**: `POST /mcp` — `GET` and `DELETE` answer `405` with an `Allow: POST` header.
 - **Body**: JSON-RPC 2.0 Request
-- **Headers**: 
-  - `Content-Type: application/json`
-  - `mcp-session-id`: (Optional) Session identifier
+- **Request headers**:
+  - `Content-Type: application/json` (required; anything else is rejected with `415`)
+  - `MCP-Protocol-Version`: (Optional) rejected with `400` if it names an unsupported version
+- **Response headers**:
+  - `MCP-Protocol-Version`: the version this build speaks
+
+### Request handling
+
+| Condition | Response |
+| --- | --- |
+| Body larger than `MCP_HTTP_MAX_BODY_SIZE` | `413`, rejected before any buffer is allocated |
+| No `Content-Length` (chunked upload) | `411` |
+| `Content-Type` is not `application/json` | `415` |
+| `Origin` present but not targeting the device IP or advertised `<server-name>.local` hostname | `403` (DNS-rebinding guard) |
+| Fewer body bytes than declared | `400` |
+| Notification (no `id`) | `202` with no body |
+| Tool-call queue full | `200` with JSON-RPC error `-32000` |
+
+### Compile-time options
+
+| Macro | Default | Effect |
+| --- | --- | --- |
+| `MCP_HTTP_MAX_BODY_SIZE` | `8192` | Largest accepted POST body, in bytes |
+| `MCP_HTTP_JOB_QUEUE_DEPTH` | `4` | Queued `tools/call` jobs before new ones are answered "server busy" |
+| `MCP_HTTP_WORKER_STACK_SIZE` | `8192` | Stack of the task that runs tool handlers |
+| `MCP_HTTP_FAST_PATH_WAIT_MS` | `20` | Inline wait for a quick tool before falling back to a deferred reply; `0` always defers |
+| `MCP_OMIT_TEXT_WHEN_STRUCTURED` | `0` | When `1`, an object result is sent only as `structuredContent` |
+
+## Testing
+
+The library has a native (host) test suite; no hardware required:
+
+```bash
+pio test -e native
+```
+
+`pio test -e native-san` runs the same suite under AddressSanitizer and UBSan,
+and `scripts/coverage.sh` reports line coverage over `src/` and `include/`.
 
 # Contact Us
 

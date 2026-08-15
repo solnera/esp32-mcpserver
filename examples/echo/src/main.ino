@@ -48,8 +48,16 @@ void setup() {
         .required({"text"})
         .build();
     echoTool.handler = std::make_shared<EchoHandler>();
-    mcpServer->RegisterTool(echoTool);
+    mcpServer->RegisterTool(std::move(echoTool));
     Serial.println("Tool registered: echo");
+
+    // Register every tool before begin(): starting the listener first would
+    // race request handlers against mutations of the tool registry.
+    if (!mcpServer->begin()) {
+        Serial.println("Failed to start MCP server!");
+        return;
+    }
+
     Serial.println("\n========================================");
     Serial.println("MCP Server started successfully!");
     Serial.printf("Access URL: http://%s:%d/mcp\n", WiFi.localIP().toString().c_str(), MCP_PORT);
