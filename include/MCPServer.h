@@ -5,25 +5,82 @@
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
-// MCP protocol version
-constexpr const char* PROTOCOL_VERSION = "2024-11-05";
-constexpr const char* DEFAULT_SERVER_NAME = "ESP32-MCP-Server";
-constexpr const char* DEFAULT_SERVER_VERSION = "1.0.0";
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
+// MCP protocol versions supported by this library. PROTOCOL_VERSION is the
+// default, used when the client does not request a supported legacy version.
+extern const char* const PROTOCOL_VERSION;
+extern const char* const PROTOCOL_VERSION_2025_06_18;
+extern const char* const PROTOCOL_VERSION_2025_03_26;
+extern const char* const DEFAULT_SERVER_NAME;
+extern const char* const DEFAULT_SERVER_VERSION;
+
+// Upper bound on an accepted POST body. Larger requests are rejected with
+// HTTP 413 before any buffer is allocated, so a hostile or buggy client cannot
+// exhaust the heap by declaring a huge Content-Length.
+#ifndef MCP_HTTP_MAX_BODY_SIZE
+#define MCP_HTTP_MAX_BODY_SIZE 8192
+#endif
+
+// Depth of the tools/call hand-off queue between the async_tcp task and the
+// worker task. A full queue answers new tool calls immediately with JSON-RPC
+// -32000 ("server busy") instead of buffering without bound.
+#ifndef MCP_HTTP_JOB_QUEUE_DEPTH
+#define MCP_HTTP_JOB_QUEUE_DEPTH 4
+#endif
+
+// Stack size of the worker task that runs tool handlers.
+#ifndef MCP_HTTP_WORKER_STACK_SIZE
+#define MCP_HTTP_WORKER_STACK_SIZE 8192
+#endif
+
+// How long a tools/call may be waited on inline before falling back to the
+// deferred chunked reply. The deferred path can only be written when the
+// connection next polls (one lwIP coarse tick, ~500 ms), so without a short
+// wait even a 2 ms tool answers in half a second. The cost is blocking
+// async_tcp for at most this long. Set to 0 to always defer.
+#ifndef MCP_HTTP_FAST_PATH_WAIT_MS
+#define MCP_HTTP_FAST_PATH_WAIT_MS 20
+#endif
+
+#ifdef MCP_HTTP_TEST_HOOKS
+/* Test-only: force the next `n` deferred-job allocations to fail (simulate
+ * OOM). Compiled out of production builds. */
+void mcp_http_test_fail_next_job_alloc(int n);
+#endif
 
 struct MCPRequest {
     std::string method;
-    JsonDocument idDoc;
-    JsonDocument paramsDoc;
 
-    MCPRequest() : method("") {}
+    /* The parse result is retained whole and params() is a view into it, so a
+     * tools/call payload is never deep-copied out into a second document. The
+     * id keeps its own (scalar-sized) copy: parseRequest deliberately leaves it
+     * null for a malformed id so the reply carries id:null, which a view into
+     * doc could not express. */
+    JsonDocument doc;
+    JsonDocument idDoc;
+    bool hasIdField;
+    bool parseError;
+    bool invalidRequest;
+    // Set only once params has passed validation, so the early-return paths
+    // expose no params at all.
+    bool paramsChecked;
+
+    MCPRequest()
+        : method(""), hasIdField(false), parseError(false), invalidRequest(false), paramsChecked(false) {}
 
     JsonVariantConst params() const {
-        return paramsDoc.as<JsonVariantConst>();
+        return paramsChecked ? doc["params"] : JsonVariantConst();
     }
 
     JsonVariantConst id() const {
@@ -31,7 +88,11 @@ struct MCPRequest {
     }
 
     bool hasParams() const {
-        return !paramsDoc.isNull();
+        return paramsChecked && !doc["params"].isNull();
+    }
+
+    bool isNotification() const {
+        return !parseError && !hasIdField;
     }
 };
 
@@ -39,12 +100,24 @@ struct MCPResponse {
     JsonDocument idDoc;
     JsonDocument resultDoc;
     JsonDocument errorDoc;
-    int code;
 
-    MCPResponse() : code(200) {}
-    MCPResponse(int code, const JsonVariantConst& id) : code(code) {
+    /* Already-serialized result JSON, spliced straight into the reply. Lets a
+     * handler hand back a cached body (tools/list) without rebuilding the tree
+     * and without a document-to-document deep copy. Takes precedence over
+     * resultDoc when non-empty. */
+    std::string rawResult;
+
+    int code;
+    bool body;
+
+    MCPResponse() : code(200), body(true) {}
+    MCPResponse(const JsonVariantConst& id) : code(200), body(true) {
         idDoc.set(id);
     }
+    MCPResponse(int code, const JsonVariantConst& id) : code(code), body(true) {
+        idDoc.set(id);
+    }
+    MCPResponse(int code, bool body) : code(code), body(body) {}
 
     JsonVariantConst id() const {
         return idDoc.as<JsonVariantConst>();
@@ -57,10 +130,13 @@ struct MCPResponse {
     }
 
     bool hasResult() const {
-        return !resultDoc.isNull();
+        return !rawResult.empty() || !resultDoc.isNull();
     }
     bool hasError() const {
         return !errorDoc.isNull();
+    }
+    bool hasBody() const {
+        return body;
     }
 };
 
@@ -168,6 +244,17 @@ class ToolHandler {
 public:
     virtual ~ToolHandler() = default;
     virtual JsonDocument call(JsonDocument params) = 0;
+
+    /* Error-reporting variant; this is what the dispatcher invokes. The default
+     * runs call() and reports success, so existing single-method handlers keep
+     * working unchanged. To signal an execution failure (surfaced to the client
+     * as result.isError = true, per MCP), override BOTH overloads and set
+     * isError here; call(params) can simply delegate:
+     *   bool ignored; return call(std::move(params), ignored); */
+    virtual JsonDocument call(JsonDocument params, bool& isError) {
+        isError = false;
+        return call(std::move(params));
+    }
 };
 
 // Tool definition
@@ -182,54 +269,91 @@ public:
     std::shared_ptr<ToolHandler> handler;
 };
 
-// Flexible array body buffer, allocated with a single malloc() so that
-// ESPAsyncWebServer's free(_tempObject) cleanly releases everything.
-struct BodyBuffer {
-    size_t length;
-    size_t capacity;
-    char data[];  // C99 flexible array member (supported by GCC/Clang)
-
-    static BodyBuffer* create(size_t capacity) {
-        auto* buf = static_cast<BodyBuffer*>(malloc(sizeof(BodyBuffer) + capacity + 1));
-        if (buf) {
-            buf->length = 0;
-            buf->capacity = capacity;
-            buf->data[0] = '\0';
-        }
-        return buf;
-    }
-};
-
 class MCPServer {
 public:
     MCPServer(uint16_t port, const String& name = DEFAULT_SERVER_NAME,
               const String& version = DEFAULT_SERVER_VERSION,
               const String& instructions = "");
     ~MCPServer();
+
     void RegisterTool(const Tool& tool);
+    // Overload for callers that can give up ownership: skips the deep copy of
+    // the schema documents. Equivalent in every other respect.
+    void RegisterTool(Tool&& tool);
+
+    /* Starts the HTTP listener. Register all tools first: doing so afterwards
+     * would race the request handlers against mutations of the tool registry.
+     * Call only once WiFi is connected — setupMDNS() reads WiFi.localIP() to
+     * publish the endpoint TXT record. Returns false if the server could not
+     * be created; a worker-task failure is not fatal (tool calls then run
+     * inline) and still returns true. */
+    bool begin();
 
 private:
     void setupWebServer();
-    std::string generateSessionId();
-    std::string serializeResponse(const MCPResponse& response);
+    void setupMDNS();
+    void handlePostComplete(AsyncWebServerRequest* request);
+    void handleJsonBody(AsyncWebServerRequest* request, const char* body);
+    void deferToolCall(AsyncWebServerRequest* request, MCPRequest&& mcpRequest);
+    void sendJSONRPCError(AsyncWebServerRequest* request, int httpCode, ErrorCode rpcCode, const char* message);
+    void sendMCPResponse(AsyncWebServerRequest* request, const MCPResponse& response);
+    bool validateProtocolVersionHeader(AsyncWebServerRequest* request);
+    bool validateOriginHeader(AsyncWebServerRequest* request);
+    std::string generateUUID();
+    std::string mdnsHostname() const;
 
+    bool startWorker();
+    void stopWorker();
+    static void workerEntry(void* ctx);
+
+    /* Protocol layer. Protected rather than private so the native test suite
+     * can subclass and drive it without going through the HTTP transport. */
+protected:
+    MCPRequest parseRequest(const char* json);
     MCPRequest parseRequest(const std::string& json);
-
-    MCPResponse createJSONRPCError(int httpCode, int code, const JsonVariantConst& id,
+    std::string serializeResponse(const MCPResponse& response);
+    MCPResponse createJSONRPCError(int httpCode, int rpcCode, const JsonVariantConst& id,
                                    const std::string& message);
     MCPResponse handle(MCPRequest& request);
     MCPResponse handleInitialize(MCPRequest& request);
-    MCPResponse handleInitialized(MCPRequest& request);
+    MCPResponse handlePing(MCPRequest& request);
     MCPResponse handleToolsList(MCPRequest& request);
     MCPResponse handleFunctionCalls(MCPRequest& request);
+    bool isSupportedProtocolVersion(const char* version) const;
+    const char* negotiateProtocolVersion(JsonVariantConst params) const;
 
-private:
-    std::map<String, Tool> tools;
+    /* Serialized tools/list body, rebuilt only after the tool set changes.
+     * Capabilities advertise listChanged:false, so between registrations this
+     * is a constant — and clients ask for it on every session start. Guarded by
+     * toolsMutex along with the registry itself, since tools/list is served on
+     * async_tcp while tools/call runs on the worker task. */
+    const std::string& toolsListJson();
+
+    /* Keyed on std::string rather than Arduino String so a lookup key built
+     * from the request costs no heap: short-string optimization keeps tool
+     * names of ~15 characters entirely on the stack, whereas String always
+     * allocates. */
+    std::map<std::string, Tool> tools;
+    std::string toolsListCache;
+    bool toolsListDirty = true;
     std::mutex toolsMutex;
+
     AsyncWebServer* server;
+    uint16_t port;
+    bool started = false;
+
     String serverName;
     String serverVersion;
     String serverInstructions;
+
+    /* tools/call handlers run on this worker task, fed through job_queue, so a
+     * slow or blocking handler never stalls the async_tcp task (which services
+     * every TCP connection in the firmware). Null when startWorker() failed —
+     * tools/call then degrades to inline execution. */
+    QueueHandle_t job_queue = nullptr;
+    TaskHandle_t worker_handle = nullptr;
+    SemaphoreHandle_t worker_done = nullptr;
+    std::atomic<bool> worker_exit{false};
 };
 
 #endif  // MCP_SERVER_H
