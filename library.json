@@ -1,6 +1,6 @@
 {
     "name": "ESP32-MCPServer",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "description": "Model Context Protocol (MCP) Server library for ESP32. Implements MCP server functionality over HTTP/JSON-RPC, with tool calls executed on a worker task so blocking handlers never stall the async TCP task.",
     "keywords": "mcp, server, esp32, async, llm, ai",
     "repository": {
