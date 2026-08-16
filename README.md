@@ -61,7 +61,7 @@ Add the library to your project's `platformio.ini`:
 
 ```ini
 lib_deps =
-    solnera/ESP32-MCPServer@^0.2.0
+    solnera/ESP32-MCPServer@^0.2.1
     ESP32Async/ESPAsyncWebServer@^3.6.0
     ESP32Async/AsyncTCP@^3.3.2
 ```
