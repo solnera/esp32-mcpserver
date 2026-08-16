@@ -7,8 +7,12 @@
  *    like the real library — so an aborted upload exercises the same teardown
  *    path (a C++ object stored there would leak / corrupt the heap).
  *  - Header lookup is case-insensitive.
- *  - Handlers are registered per (uri, method); tests fetch them via
- *    mock_async_web::lastServer() and drive body/request callbacks manually.
+ *  - The MCP endpoint is registered as an AsyncWebHandler that matches on path
+ *    alone (the real library would refuse a server->on() route for any request
+ *    whose Accept carries text/event-stream). findRoute() probes the registered
+ *    handlers with a synthetic request the same way AsyncWebServer::_attachHandler
+ *    does, so tests still drive body/request callbacks per (uri, method) via
+ *    mock_async_web::lastServer().
  *  - Chunked/deferred responses mirror AsyncChunkedResponse: send() keeps the
  *    response object alive and the filler is pulled via pumpChunked() (the
  *    test-side stand-in for the ack/poll cycle) until it returns 0; a filler
@@ -24,7 +28,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <list>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -111,6 +117,16 @@ public:
 
     uint8_t version() const { return version_; }
 
+    const String& url() const { return url_; }
+
+    int method() const { return method_; }
+
+    /* The real library downgrades any request whose Accept carries
+     * text/event-stream to RCT_EVENT, and AsyncCallbackWebHandler::canHandle()
+     * then declines it. MCP clients send exactly that header on every POST, so
+     * routing has to be exercised with it modelled. */
+    bool isHTTP() const { return !eventStreamAccept_; }
+
     AsyncWebServerResponse* beginResponse(int code, const String& contentType, const String& body) {
         return new AsyncWebServerResponse(code, contentType, body);
     }
@@ -172,6 +188,9 @@ public:
 
     void setHeader(const char* name, const char* value) {
         headers_.emplace(lower(name), AsyncWebHeader(value));
+        if (lower(name) == "accept" && lower(value).find("text/event-stream") != std::string::npos) {
+            eventStreamAccept_ = true;
+        }
     }
 
     void setContentLength(size_t length) { contentLength_ = length; }
@@ -179,6 +198,10 @@ public:
     void setContentType(const char* type) { contentType_ = type; }
 
     void setVersion(uint8_t version) { version_ = version; }
+
+    void setUrl(const char* url) { url_ = url; }
+
+    void setMethod(int method) { method_ = method; }
 
     int responseCount = 0;
     int lastCode = -1;
@@ -206,10 +229,36 @@ private:
     std::map<std::string, AsyncWebHeader> headers_;
     size_t contentLength_ = 0;
     uint8_t version_ = 1;
+    String url_ = String("/mcp");
+    int method_ = HTTP_POST;
+    bool eventStreamAccept_ = false;
     String contentType_ = String("application/json");
     AsyncWebServerResponse* _pendingResponse = nullptr;
     std::string _chunkBody;
     size_t _chunkIndex = 0;
+};
+
+/* Mirrors the subset of the real base class that MCPServer overrides. The
+ * default canHandle() declines, matching the library. */
+class AsyncWebHandler {
+public:
+    virtual ~AsyncWebHandler() = default;
+
+    virtual bool canHandle(AsyncWebServerRequest* request) const {
+        (void)request;
+        return false;
+    }
+    virtual void handleRequest(AsyncWebServerRequest* request) { (void)request; }
+    virtual void handleBody(AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index,
+                            size_t total) {
+        (void)request;
+        (void)data;
+        (void)len;
+        (void)index;
+        (void)total;
+    }
+    // The real server skips body delivery entirely for a trivial handler.
+    virtual bool isRequestHandlerTrivial() const { return true; }
 };
 
 using ArRequestHandlerFunction = std::function<void(AsyncWebServerRequest*)>;
@@ -257,21 +306,62 @@ public:
         routes.push_back({uri, method, std::move(onRequest), std::move(onBody)});
     }
 
+    // Takes ownership, like the real AsyncWebServer (a unique_ptr list).
+    AsyncWebHandler& addHandler(AsyncWebHandler* handler) {
+        handlers.emplace_back(handler);
+        return *handlers.back();
+    }
+
     void onNotFound(ArRequestHandlerFunction handler) { notFound = std::move(handler); }
 
     void begin() { started = true; }
 
-    const Route* findRoute(const char* uri, int method) const {
+    /* Resolves a request the way AsyncWebServer::_attachHandler does: explicit
+     * on() routes first — which, like AsyncCallbackWebHandler::canHandle(),
+     * decline anything that is not plain HTTP — then the registered handlers,
+     * which decide for themselves. A matched handler is surfaced as a
+     * forwarding Route so tests see one shape either way; a nullptr return is
+     * the catch-all (onNotFound) taking over. */
+    const Route* findRoute(AsyncWebServerRequest* request) const {
         for (const auto& route : routes) {
-            if (route.uri == uri && (route.method & method) != 0) {
+            if (request->isHTTP() && route.uri == request->url().c_str() &&
+                (route.method & request->method()) != 0) {
                 return &route;
             }
         }
+
+        for (const auto& handler : handlers) {
+            if (!handler->canHandle(request)) {
+                continue;
+            }
+            AsyncWebHandler* target = handler.get();
+            // std::list: the returned pointer must survive later lookups.
+            handlerRoutes_.push_back(
+                Route{request->url().c_str(), request->method(),
+                      [target](AsyncWebServerRequest* r) { target->handleRequest(r); },
+                      target->isRequestHandlerTrivial()
+                          ? ArBodyHandlerFunction()
+                          : [target](AsyncWebServerRequest* r, uint8_t* data, size_t len, size_t index,
+                                     size_t total) { target->handleBody(r, data, len, index, total); }});
+            return &handlerRoutes_.back();
+        }
         return nullptr;
+    }
+
+    // Convenience for tests that only care about (uri, method) routing.
+    const Route* findRoute(const char* uri, int method) const {
+        AsyncWebServerRequest probe;
+        probe.setUrl(uri);
+        probe.setMethod(method);
+        return findRoute(&probe);
     }
 
     uint16_t port;
     bool started = false;
     std::vector<Route> routes;
+    std::vector<std::unique_ptr<AsyncWebHandler>> handlers;
     ArRequestHandlerFunction notFound;
+
+private:
+    mutable std::list<Route> handlerRoutes_;
 };
