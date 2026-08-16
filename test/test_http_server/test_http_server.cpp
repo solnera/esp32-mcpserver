@@ -72,9 +72,11 @@ struct TestServer {
 };
 
 /* Feeds `body` through the POST route in `chunkSize`-byte pieces and finishes
- * the request. chunkSize 0 = one chunk. */
+ * the request. chunkSize 0 = one chunk. The route is resolved from the request
+ * itself, so header-dependent routing (an SSE-flavoured Accept) is exercised
+ * rather than assumed away. */
 void drivePost(TestServer& srv, AsyncWebServerRequest& req, const std::string& body, size_t chunkSize = 0) {
-    const AsyncWebServer::Route* route = srv.postRoute();
+    const AsyncWebServer::Route* route = srv.web->findRoute(&req);
     TEST_ASSERT_NOT_NULL(route);
 
     req.setContentLength(body.size());
@@ -558,12 +560,44 @@ void test_ping_over_http(void) {
     TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "\"result\":{}"));
 }
 
+void test_streamable_http_accept_header_still_routes_to_endpoint(void) {
+    /* MCP's Streamable HTTP transport requires this Accept on every client
+     * POST. ESPAsyncWebServer reads the text/event-stream part as an SSE
+     * subscription and refuses the request from any server->on() route, which
+     * sent every conforming client to the catch-all 404 while a bare curl
+     * worked. The endpoint therefore matches on path alone. */
+    TestServer srv;
+    AsyncWebServerRequest req;
+    req.setHeader("Accept", "application/json, text/event-stream");
+    drivePost(srv, req, R"({"jsonrpc":"2.0","id":1,"method":"ping"})");
+
+    TEST_ASSERT_EQUAL_INT(200, req.lastCode);
+    TEST_ASSERT_NOT_NULL(strstr(req.lastBody.c_str(), "\"result\":{}"));
+}
+
+void test_streamable_http_accept_header_get_stream_probe_gets_405(void) {
+    // The client's server-initiated-stream probe. This server offers no stream;
+    // MCP prescribes 405 for that, and it must not fall through to the 404.
+    TestServer srv;
+    AsyncWebServerRequest req;
+    req.setMethod(HTTP_GET);
+    req.setHeader("Accept", "text/event-stream");
+
+    const AsyncWebServer::Route* route = srv.web->findRoute(&req);
+    TEST_ASSERT_NOT_NULL(route);
+    route->onRequest(&req);
+
+    TEST_ASSERT_EQUAL_INT(405, req.lastCode);
+    TEST_ASSERT_EQUAL_STRING("POST", req.lastHeaders["Allow"].c_str());
+}
+
 void test_get_mcp_returns_405(void) {
     TestServer srv;
     const AsyncWebServer::Route* route = srv.web->findRoute("/mcp", HTTP_GET);
     TEST_ASSERT_NOT_NULL(route);
 
     AsyncWebServerRequest req;
+    req.setMethod(HTTP_GET);
     route->onRequest(&req);
 
     TEST_ASSERT_EQUAL_INT(405, req.lastCode);
@@ -575,6 +609,7 @@ void test_get_mcp_rejects_invalid_origin_before_method_check(void) {
     TEST_ASSERT_NOT_NULL(route);
 
     AsyncWebServerRequest req;
+    req.setMethod(HTTP_GET);
     req.setHeader("Origin", "http://evil.example:3000");
     req.setHeader("Host", "evil.example:3000");
     route->onRequest(&req);
@@ -590,6 +625,7 @@ void test_delete_mcp_returns_405_with_allow(void) {
     TEST_ASSERT_NOT_NULL(route);
 
     AsyncWebServerRequest req;
+    req.setMethod(HTTP_DELETE);
     route->onRequest(&req);
 
     TEST_ASSERT_EQUAL_INT(405, req.lastCode);
@@ -671,6 +707,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_advertised_mdns_origin_is_accepted_case_insensitively);
     RUN_TEST(test_notification_returns_202_without_body);
     RUN_TEST(test_ping_over_http);
+    RUN_TEST(test_streamable_http_accept_header_still_routes_to_endpoint);
+    RUN_TEST(test_streamable_http_accept_header_get_stream_probe_gets_405);
     RUN_TEST(test_get_mcp_returns_405);
     RUN_TEST(test_get_mcp_rejects_invalid_origin_before_method_check);
     RUN_TEST(test_delete_mcp_returns_405_with_allow);

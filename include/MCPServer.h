@@ -284,14 +284,16 @@ public:
     /* Starts the HTTP listener. Register all tools first: doing so afterwards
      * would race the request handlers against mutations of the tool registry.
      * Call only once WiFi is connected — setupMDNS() reads WiFi.localIP() to
-     * publish the endpoint TXT record. Returns false if the server could not
-     * be created; a worker-task failure is not fatal (tool calls then run
-     * inline) and still returns true. */
+     * publish the endpoint TXT record. Returns false if the server or its
+     * endpoint handler could not be created; a worker-task failure is not fatal
+     * (tool calls then run inline) and still returns true. */
     bool begin();
 
 private:
-    void setupWebServer();
+    // False only when the endpoint handler could not be allocated.
+    bool setupWebServer();
     void setupMDNS();
+    void handleEndpointRequest(AsyncWebServerRequest* request);
     void handlePostComplete(AsyncWebServerRequest* request);
     void handleJsonBody(AsyncWebServerRequest* request, const char* body);
     void deferToolCall(AsyncWebServerRequest* request, MCPRequest&& mcpRequest);

@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <new>
 #include <utility>
 
@@ -92,6 +93,52 @@ private:
     HttpToolJob* job_;
 };
 
+/* Routes the MCP endpoint by path alone.
+ *
+ * server->on() cannot be used here. MCP's Streamable HTTP transport requires
+ * every client POST to carry `Accept: application/json, text/event-stream`, and
+ * ESPAsyncWebServer reads any Accept containing text/event-stream as an SSE
+ * subscription: it marks the request RCT_EVENT, after which
+ * AsyncCallbackWebHandler::canHandle() declines it (that check insists on
+ * isHTTP()) and the request falls through to the catch-all. The result is a 404
+ * for every spec-conformant MCP client, on both POST and the GET stream probe,
+ * while a hand-written curl without the header works fine.
+ *
+ * Matching on the path and dispatching on the method ourselves keeps the
+ * connection type out of the routing decision. Nothing downstream consults it:
+ * RCT_EVENT only ever gates handler selection. */
+class MCPEndpointHandler : public AsyncWebHandler {
+public:
+    using RequestFn = std::function<void(AsyncWebServerRequest*)>;
+    using BodyFn = std::function<void(AsyncWebServerRequest*, uint8_t*, size_t, size_t, size_t)>;
+
+    MCPEndpointHandler(const char* uri, RequestFn onRequest, BodyFn onBody)
+        : uri_(uri), onRequest_(std::move(onRequest)), onBody_(std::move(onBody)) {}
+
+    bool canHandle(AsyncWebServerRequest* request) const override {
+        return request->url() == uri_;
+    }
+
+    void handleRequest(AsyncWebServerRequest* request) override {
+        onRequest_(request);
+    }
+
+    void handleBody(AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index,
+                    size_t total) override {
+        onBody_(request, data, len, index, total);
+    }
+
+    // A "trivial" handler never has the request body delivered to it.
+    bool isRequestHandlerTrivial() const override {
+        return false;
+    }
+
+private:
+    String uri_;
+    RequestFn onRequest_;
+    BodyFn onBody_;
+};
+
 /* Appending sink for serializeJson. ArduinoJson's std::string writer clears the
  * destination in its constructor, so emitting several documents into one buffer
  * needs a writer that only ever appends; the default Writer template picks this
@@ -145,7 +192,10 @@ bool MCPServer::begin() {
 
     // Best-effort: on failure tools/call degrades to inline execution.
     startWorker();
-    setupWebServer();
+    if (!setupWebServer()) {
+        stopWorker();  // nothing will ever feed it
+        return false;
+    }
     setupMDNS();
     started = true;
     return true;
@@ -241,12 +291,12 @@ void MCPServer::workerEntry(void* ctx) {
 // HTTP transport
 // ---------------------------------------------------------------------------
 
-void MCPServer::setupWebServer() {
+bool MCPServer::setupWebServer() {
     /* The body callback only accumulates; the response is always sent from the
-     * onRequest callback, which runs once the request is complete — including
+     * request callback, which runs once the request is complete — including
      * when there is no body at all. */
-    server->on(
-        "/mcp", HTTP_POST, [this](AsyncWebServerRequest* request) { handlePostComplete(request); }, NULL,
+    auto* endpoint = new (std::nothrow) MCPEndpointHandler(
+        "/mcp", [this](AsyncWebServerRequest* request) { handleEndpointRequest(request); },
         [this](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
             BodyBuffer* body = static_cast<BodyBuffer*>(request->_tempObject);
             if (!body) {
@@ -281,28 +331,10 @@ void MCPServer::setupWebServer() {
             memcpy(body->data + index, data, len);
             body->received = index + len;
         });
-
-    server->on("/mcp", HTTP_DELETE, [this](AsyncWebServerRequest* request) {
-        if (!validateOriginHeader(request)) {
-            sendJSONRPCError(request, 403, ErrorCode::INVALID_REQUEST, "Forbidden Origin");
-            return;
-        }
-        AsyncWebServerResponse* response =
-            request->beginResponse(405, "application/json", "{\"error\":\"Method Not Allowed\"}");
-        response->addHeader("Allow", "POST");
-        request->send(response);
-    });
-
-    server->on("/mcp", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        if (!validateOriginHeader(request)) {
-            sendJSONRPCError(request, 403, ErrorCode::INVALID_REQUEST, "Forbidden Origin");
-            return;
-        }
-        AsyncWebServerResponse* response =
-            request->beginResponse(405, "application/json", "{\"error\":\"Method Not Allowed\"}");
-        response->addHeader("Allow", "POST");
-        request->send(response);
-    });
+    if (!endpoint) {
+        return false;
+    }
+    server->addHandler(endpoint);  // the server owns it from here
 
     server->onNotFound([this](AsyncWebServerRequest* request) {
         if (!validateOriginHeader(request)) {
@@ -313,6 +345,27 @@ void MCPServer::setupWebServer() {
     });
 
     server->begin();
+    return true;
+}
+
+/* Every method reaching /mcp lands here, since the endpoint handler matches on
+ * path alone. POST carries the JSON-RPC traffic; everything else — including the
+ * GET the MCP client uses to probe for a server-initiated SSE stream, which this
+ * server does not offer — is answered with the 405 the spec prescribes. */
+void MCPServer::handleEndpointRequest(AsyncWebServerRequest* request) {
+    if (request->method() == HTTP_POST) {
+        handlePostComplete(request);
+        return;
+    }
+
+    if (!validateOriginHeader(request)) {
+        sendJSONRPCError(request, 403, ErrorCode::INVALID_REQUEST, "Forbidden Origin");
+        return;
+    }
+    AsyncWebServerResponse* response =
+        request->beginResponse(405, "application/json", "{\"error\":\"Method Not Allowed\"}");
+    response->addHeader("Allow", "POST");
+    request->send(response);
 }
 
 std::string MCPServer::generateUUID() {
